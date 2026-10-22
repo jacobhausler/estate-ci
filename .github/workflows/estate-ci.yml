@@ -1,0 +1,641 @@
+# estate-ci — the estate CI contract, gen-4 (NEXTGEN-CI.md section (d)).
+# workflow_call reusable: exactly seven knobs, pins x components matrix (D11),
+# fail-closed rollup named gates, admission teeth (five ways), preflight (S7).
+# Bumping this contract is a visible per-repo PR via the ci-contract: pin line.
+name: estate-ci
+
+on:
+  workflow_call:
+    inputs:
+      legs:
+        description: 'JSON: pin arms [{label,python,hermes_pin,consumes}] or "default" (single tip arm)'
+        type: string
+        required: false
+        default: 'default'
+      components:
+        description: 'JSON array, subset of [py,node,docker,go,doc,receipt,pkg]'
+        type: string
+        required: false
+        default: '["py"]'
+      shards:
+        description: 'computed only: "auto"; any literal number is hand-set and reds preflight'
+        type: string
+        required: false
+        default: 'auto'
+      lane_cap_s:
+        description: 'suite-time cap per leg, seconds (default 150)'
+        type: number
+        required: false
+        default: 150
+      budget:
+        description: 'pointer to budget json (pr_gate_wall_s, runner_min_per_pr, runner_min_wk)'
+        type: string
+        required: false
+        default: 'tests/budget.json'
+      paths:
+        description: 'JSON admission spec {allow,deny,machine} or "default" (anchored docs allow, deny-wins)'
+        type: string
+        required: false
+        default: 'default'
+      artifact-gate:
+        description: 'JSON {provenance_dir,artifact_name,retention_days} or "default" (tests/runs, ledger, 90d)'
+        type: string
+        required: false
+        default: 'default'
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: estate-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.render.outputs.matrix }}
+      leg_timeout_minutes: ${{ steps.render.outputs.leg_timeout_minutes }}
+      plan: ${{ steps.render.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse caller YAML, resolve reusable ref, render matrix, verify ci-contract pin
+        id: render
+        env:
+          IN_LEGS: ${{ inputs.legs }}
+          IN_COMPONENTS: ${{ inputs.components }}
+          IN_SHARDS: ${{ inputs.shards }}
+          IN_LANE_CAP_S: ${{ inputs.lane_cap_s }}
+          IN_BUDGET: ${{ inputs.budget }}
+          IN_PATHS: ${{ inputs.paths }}
+          IN_ARTIFACT_GATE: ${{ inputs['artifact-gate'] }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, math, os, pathlib, re, subprocess, sys
+          KNOBS = {'legs','components','shards','lane_cap_s','budget','paths','artifact-gate'}
+          COMPS = {'py','node','docker','go','doc','receipt','pkg'}
+          AG_DEFAULT = {'provenance_dir':'tests/runs','artifact_name':'ledger','retention_days':90}
+          PIN_RE = re.compile(r'^[ \t]*#[ \t]*ci-contract:[ \t]*estate-ci@(v\d+(?:\.\d+){0,2})[ \t]*$', re.M)
+          USE_LOCAL = re.compile(r'^\./([^\s]+\.ya?ml)$')
+          USE_REMOTE = re.compile(r'^jacobhausler/estate-ci/(\.github/workflows/estate-ci\.yml)@([^\s]+)$')
+          def fail(msg):
+              print('::error::PREFLIGHT FAIL ' + msg)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                  f.write('- `PREFLIGHT FAIL %s`\n' % msg)
+              sys.exit(1)
+          def gh_api(*args):
+              p = subprocess.run(['gh','api',*args], capture_output=True, text=True)
+              return p.returncode, p.stdout.strip(), p.stderr.strip()
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(['pip','install','--user','--quiet','pyyaml'], capture_output=True)
+              try:
+                  import yaml
+              except ImportError:
+                  subprocess.run(['pip','install','--user','--quiet','--break-system-packages','pyyaml'], capture_output=True)
+                  try:
+                      import yaml
+                  except ImportError:
+                      fail('pyyaml-unavailable-on-runner')
+          def load_json_env(name, what):
+              try:
+                  return json.loads(os.environ[name])
+              except Exception as e:
+                  fail('input-%s-not-json:%s' % (what, str(e)[:80]))
+          legs = [{'label':'tip','python':'3.12','hermes_pin':'tip'}]
+          if os.environ['IN_LEGS'] != 'default':
+              legs = load_json_env('IN_LEGS','legs')
+          if not isinstance(legs, list) or not legs:
+              fail('legs-not-list')
+          seen_labels = set()
+          for arm in legs:
+              if not isinstance(arm, dict) or not isinstance(arm.get('label'), str):
+                  fail('leg-arm-missing-label')
+              lab = arm['label']
+              if not re.fullmatch(r'[A-Za-z0-9._-]{1,32}', lab) or lab in seen_labels:
+                  fail('leg-label-bad-or-dup:%s' % lab)
+              seen_labels.add(lab)
+              for k in ('python','hermes_pin'):
+                  if k in arm and not isinstance(arm[k], str):
+                      fail('leg-%s-%s-not-string' % (lab, k))
+              extra = set(arm) - {'label','python','hermes_pin','consumes'}
+              if extra:
+                  fail('leg-%s-unknown-keys:%s' % (lab, sorted(extra)))
+              c = arm.get('consumes')
+              if c is not None and (not isinstance(c, list) or not c or not set(c) <= COMPS):
+                  fail('leg-%s-consumes-invalid' % lab)
+          comps = load_json_env('IN_COMPONENTS','components')
+          if not isinstance(comps, list) or not comps or not set(comps) <= COMPS or len(set(comps)) != len(comps):
+              fail('components-invalid')
+          if os.environ['IN_SHARDS'] != 'auto':
+              fail('shards-hand-set:%s-computed-only' % os.environ['IN_SHARDS'])
+          lane_cap = float(os.environ['IN_LANE_CAP_S'])
+          if not (10 <= lane_cap <= 900):
+              fail('lane_cap_s-out-of-range:%s' % lane_cap)
+          budget_ptr = os.environ['IN_BUDGET']
+          if not re.fullmatch(r'[\w./-]+\.json', budget_ptr):
+              fail('budget-pointer-invalid:%s' % budget_ptr)
+          if os.environ['IN_PATHS'] != 'default':
+              spec = load_json_env('IN_PATHS','paths')
+              if not isinstance(spec, dict) or set(spec) - {'allow','deny','machine'}:
+                  fail('paths-spec-shape')
+              for k in ('allow','deny','machine'):
+                  if k in spec:
+                      if not isinstance(spec[k], list) or any(not isinstance(p, str) for p in spec[k]):
+                          fail('paths-spec-shape-list:%s' % k)
+                      for p in spec[k]:
+                          try:
+                              re.compile(p)
+                          except Exception:
+                              fail('paths-spec-bad-regex:%s' % p)
+              for p in spec.get('allow', []):
+                  if not p.startswith('^'):
+                      fail('paths-allow-unanchored:%s' % p)
+          ag = dict(AG_DEFAULT)
+          ag_raw = os.environ['IN_ARTIFACT_GATE']
+          if ag_raw != 'default':
+              loaded = load_json_env('IN_ARTIFACT_GATE','artifact-gate')
+              if not isinstance(loaded, dict) or set(loaded) - set(AG_DEFAULT):
+                  fail('artifact-gate-shape')
+              ag.update(loaded)
+          if not re.fullmatch(r'[\w./-]{1,128}', str(ag['provenance_dir'])):
+              fail('artifact-gate-provenance_dir-invalid')
+          if not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', str(ag['artifact_name'])):
+              fail('artifact-gate-artifact_name-invalid')
+          ret = ag['retention_days']
+          if not isinstance(ret, int) or not (1 <= ret <= 365):
+              fail('artifact-gate-retention_days:%s' % ret)
+          callers, prefixes = [], []
+          for f in sorted(glob.glob('.github/workflows/*.yml') + glob.glob('.github/workflows/*.yaml')):
+              txt = pathlib.Path(f).read_text()
+              try:
+                  doc = yaml.safe_load(txt)
+              except Exception as e:
+                  fail('%s:yaml-parse:%s' % (f, str(e)[:120]))
+              if not isinstance(doc, dict) or not isinstance(doc.get('jobs'), dict):
+                  continue
+              trig = doc.get('on', doc.get(True))
+              is_reusable = trig == 'workflow_call' or (isinstance(trig, dict) and set(trig) == {'workflow_call'})
+              for jid, job in doc['jobs'].items():
+                  uses = (job or {}).get('uses') or ''
+                  ml, mr = USE_LOCAL.match(uses), USE_REMOTE.match(uses)
+                  if jid == 'gates' and not uses and not is_reusable:
+                      fail('%s:DUPLICATE-EMITTER:job-%s-shadows-required-gates' % (f, jid))
+                  if not (ml or mr):
+                      continue
+                  if ml and not pathlib.Path(ml.group(1)).exists():
+                      fail('%s:job-%s:local-reusable-missing:%s' % (f, jid, ml.group(1)))
+                  ref = mr.group(2) if mr else None
+                  if ref:
+                      rc_, out_, err_ = gh_api('repos/jacobhausler/estate-ci/git/ref/tags/%s' % ref)
+                      if rc_ != 0:
+                          fail('%s:job-%s:ci-contract-ref-%s-not-a-tag' % (f, jid, ref))
+                  pm = PIN_RE.search(txt)
+                  if not pm:
+                      fail('%s:MISSING-PIN-LINE:caller-file-needs-a-ci-contract-pin-comment' % f)
+                  if ref and ref != pm.group(1):
+                      fail('%s:job-%s:pin-line-%s-disagrees-with-uses-%s' % (f, jid, pm.group(1), ref))
+                  w = (job or {}).get('with') or {}
+                  unknown = set(w) - KNOBS
+                  if unknown:
+                      fail('%s:job-%s:unknown-knob:%s' % (f, jid, sorted(unknown)))
+                  for kk in ('legs','components','paths','artifact-gate'):
+                      vv = w.get(kk)
+                      if isinstance(vv, str) and vv != 'default' and '${' not in vv:
+                          try:
+                              json.loads(vv)
+                          except Exception:
+                              fail('%s:job-%s:with-%s-not-json' % (f, jid, kk))
+                  if 'shards' in w and not (isinstance(w['shards'], str) and ('${' in w['shards'] or w['shards'] == 'auto')):
+                      fail('%s:job-%s:shards-hand-set-in-with' % (f, jid))
+                  wprefix = 'ledger'
+                  wag = w.get('artifact-gate')
+                  if isinstance(wag, str) and wag != 'default' and '${' not in wag:
+                      try:
+                          wprefix = json.loads(wag).get('artifact_name', 'ledger')
+                      except Exception:
+                          wprefix = 'ledger'
+                  prefixes.append((f, jid, str(wprefix)))
+                  callers.append('%s#%s@%s' % (f, jid, ref or 'local'))
+          if not callers:
+              fail('no-caller-workflow-references-the-contract')
+          counts = {}
+          for f2, jid, p in prefixes:
+              counts.setdefault((f2, p), []).append(jid)
+          for (f2, p), jl in sorted(counts.items()):
+              if len(jl) > 1:
+                  fail('%s:DUPLICATE-ARTIFACT-PREFIX:%s-shared-by-%s' % (f2, p, jl))
+          timing = None
+          if pathlib.Path('tests/timing.json').exists():
+              try:
+                  timing = json.loads(pathlib.Path('tests/timing.json').read_text())
+                  assert isinstance(timing, list) and all(isinstance(r, dict) and 'case' in r for r in timing)
+              except Exception as e:
+                  fail('tests/timing.json-unparseable:%s' % str(e)[:120])
+          n_shards = 1
+          if timing and 'py' in comps:
+              total = sum(float(r.get('wall_s', 0) or 0) for r in timing)
+              n_shards = max(1, math.ceil(total / lane_cap))
+              if n_shards > 24:
+                  fail('shards-%s-exceeds-estate-ceiling-24' % n_shards)
+          rows = []
+          for arm in legs:
+              consumes = arm.get('consumes') or comps
+              for comp in comps:
+                  if comp not in consumes:
+                      continue  # D11: pins multiply only over components that consume them
+                  lanes = n_shards if (comp == 'py' and timing) else 1
+                  for lane in range(lanes):
+                      lid = '%s-%s' % (arm['label'], comp) + ('-s%do%d' % (lane, lanes) if lanes > 1 else '')
+                      rows.append({'id': lid, 'arm': arm['label'],
+                                   'python': arm.get('python', '3.12'),
+                                   'hermes_pin': arm.get('hermes_pin', 'tip'),
+                                   'component': comp, 'lane': lane, 'lanes': lanes})
+          if not rows:
+              fail('matrix-renders-empty:legs-x-components-cross-is-null')
+          if len(rows) > 24:
+              fail('matrix-%s-rows-exceeds-ceiling-24' % len(rows))
+          max_wall = max((float(r.get('wall_s', 0) or 0) for r in (timing or [])), default=0.0)
+          tmo = min(60, max(5, math.ceil((max(max_wall, lane_cap)) * 3 / 60)))
+          plan = json.dumps({'component':'py','total_cases':len(timing)}) if timing else 'null'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as o:
+              o.write('matrix<<MATRIXEOF\n' + json.dumps({'leg': rows}) + '\nMATRIXEOF\n')
+              o.write('leg_timeout_minutes=%d\n' % tmo)
+              o.write('plan<<PLANEOF\n' + plan + '\nPLANEOF\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('- `PREFLIGHT OK` callers=%s rows=%d shards=%d tmo=%dm\n' % (callers, len(rows), n_shards, tmo))
+          PY
+      - name: budget pointer probe (observe only)
+        if: always()
+        run: |
+          if test -f "$IN_BUDGET"; then echo "budget pointer resolves: $IN_BUDGET"; else echo "BUDGET SKIP reason=no-manifest-at-pointer"; fi
+        env:
+          IN_BUDGET: ${{ inputs.budget }}
+
+  admission:
+    name: admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      shape: ${{ steps.cls.outputs.shape }}
+      reason: ${{ steps.cls.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: "classify diff: fail-closed five ways (empty-diff, anchored allow, deny-wins, non-PR, md_inputs consumers)"
+        id: cls
+        env:
+          IN_PATHS: ${{ inputs.paths }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, re, subprocess, sys
+          DEFAULT = {
+            'allow': [r'^docs/.+\.md$', r'^[^/]+\.md$', r'^LICENSE(\..*)?$', r'^docs/.+\.(png|jpe?g|gif|svg|webp)$'],
+            'machine': [r'^graphify-out/'],
+            'deny': [r'^\.github/', r'^tests/', r'^tests/(timing|budget|registry)\.json$', r'^tests/md_inputs\.txt$',
+                     r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|rs|rb|sh|bash|sql|c|h|hpp|cpp|java|kt|swift|css)$',
+                     r'(^|/)(pyproject\.toml|setup\.py|setup\.cfg|MANIFEST\.in|package\.json|package-lock\.json|pnpm-lock\.yaml|uv\.lock|poetry\.lock|Cargo\.toml|Cargo\.lock|go\.mod|go\.sum|Dockerfile|Makefile|\.gitignore)$'],
+          }
+          def emit(shape, reason):
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as o:
+                  o.write('shape=%s\nreason=%s\n' % (shape, reason))
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                  f.write('- `ADMISSION %s reason=%s event=%s`\n' % (shape, reason, os.environ.get('GITHUB_EVENT_NAME')))
+              sys.exit(0)
+          def gh_json(*args):
+              p = subprocess.run(['gh','api',*args], capture_output=True, text=True)
+              if p.returncode != 0:
+                  return None
+              try:
+                  return json.loads(p.stdout)
+              except Exception:
+                  return None
+          spec = dict(DEFAULT)
+          if os.environ['IN_PATHS'] != 'default':
+              cu = json.loads(os.environ['IN_PATHS'])
+              spec = {'allow': cu.get('allow', []), 'machine': cu.get('machine', []), 'deny': cu.get('deny', DEFAULT['deny'])}
+          if os.environ['GITHUB_EVENT_NAME'] != 'pull_request':
+              emit('FULL', 'non-pr-event')
+          ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          pr = ev['pull_request']
+          repo, base, head = ev['repository']['full_name'], pr['base']['sha'], pr['head']['sha']
+          cmp_ = gh_json('repos/%s/compare/%s...%s' % (repo, base, head))
+          files = (cmp_ or {}).get('files')
+          if files is None or len(files) >= 300:
+              emit('FULL', 'diff-unparseable-or-truncated')
+          names = [f['filename'] for f in files]
+          if not names:
+              emit('FULL', 'empty-diff')
+          md_inputs = set()
+          c = gh_json('repos/%s/contents/tests/md_inputs.txt?ref=%s' % (repo, head))
+          if isinstance(c, dict) and c.get('content'):
+              try:
+                  md_inputs = {l.strip() for l in base64.b64decode(c['content']).decode('utf-8','replace').splitlines() if l.strip() and not l.startswith('#')}
+              except Exception:
+                  pass
+          def deny_hit(f):
+              return any(re.search(p, f) for p in spec['deny'])
+          def allow_hit(f):
+              return any(re.match(p, f) for p in spec['allow'])
+          def machine_hit(f):
+              return any(re.match(p, f) for p in spec['machine'])
+          if any(deny_hit(f) for f in names):
+              hit = [f for f in names if deny_hit(f)][:5]
+              emit('FULL', 'deny-wins:%s' % ','.join(hit))
+          if all(machine_hit(f) for f in names):
+              emit('MACHINE', 'graphify-out-only')
+          if any(f in md_inputs for f in names):
+              emit('FULL', 'md-input-consumer')
+          if all(allow_hit(f) for f in names):
+              emit('DOCS', 'docs-shape')
+          emit('FULL', 'outside-allow-spec')
+          PY
+
+  leg:
+    name: leg-${{ matrix.leg.id }}
+    needs: [preflight, admission]
+    if: needs.preflight.result == 'success' && needs.admission.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.preflight.outputs.leg_timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: "run leg (hook contract tools/ci/component/<component>.sh; ledger grammar emitted either way)"
+        env:
+          LEG_JSON: ${{ toJSON(matrix.leg) }}
+          ADMISSION_SHAPE: ${{ needs.admission.outputs.shape }}
+          IN_ARTIFACT_GATE: ${{ inputs['artifact-gate'] }}
+          IN_LANE_CAP_S: ${{ inputs.lane_cap_s }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, time
+          AG_DEFAULT = {'provenance_dir':'tests/runs','artifact_name':'ledger','retention_days':90}
+          ag = dict(AG_DEFAULT)
+          raw = os.environ['IN_ARTIFACT_GATE']
+          if raw != 'default':
+              ag.update(json.loads(raw))
+          leg = json.loads(os.environ['LEG_JSON'])
+          lid = leg['id']
+          run_id, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
+          ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          sha = (ev.get('pull_request') or {}).get('head', {}).get('sha') or os.environ['GITHUB_SHA']
+          repo = os.environ['GITHUB_REPOSITORY'].split('/')[1]
+          prov = '%s/%s/%s/%s/attempt-%s' % (ag['provenance_dir'], repo, sha, run_id, attempt)
+          pathlib.Path(prov).mkdir(parents=True, exist_ok=True)
+          with open(os.environ['GITHUB_ENV'], 'a') as o:
+              o.write('ESTATE_PROV_DIR=%s\n' % prov)
+              o.write('ESTATE_RETENTION=%s\n' % ag['retention_days'])
+              o.write('ESTATE_ARTIFACT_NAME=%s__%s__%s-a%s\n' % (ag['artifact_name'], lid, run_id, attempt))
+          shape = os.environ['ADMISSION_SHAPE']
+          comp = leg['component']
+          status, cases, wall, reason = 'SKIP', 0, 0, None
+          if shape == 'DOCS' and comp != 'doc':
+              reason = 'docs-shape'
+          elif shape == 'MACHINE':
+              reason = 'machine-shape'
+          else:
+              hook = pathlib.Path('tools/ci/component/%s.sh' % comp)
+              if not hook.exists():
+                  reason = 'no-hook'
+              else:
+                  cap = int(float(os.environ['IN_LANE_CAP_S']))
+                  tw = None
+                  if pathlib.Path('tests/timing.json').exists():
+                      try:
+                          tw = max((float(r.get('wall_s', 0) or 0) for r in json.loads(pathlib.Path('tests/timing.json').read_text())), default=0)
+                      except Exception:
+                          tw = None
+                  t0 = time.time()
+                  env = dict(os.environ, ESTATE_LEG_ID=lid, ESTATE_LANE=str(leg['lane']),
+                             ESTATE_LANES=str(leg['lanes']), ESTATE_COMPONENT=comp,
+                             ESTATE_CASE_TIMEOUT_S=str(int(3 * (tw or cap))))
+                  rc = subprocess.run(['bash', str(hook)], env=env).returncode
+                  wall = int(time.time() - t0)
+                  if pathlib.Path('.estate-leg-report').exists():
+                      m = re.search(r'CASES=(\d+)\s+WALL=(\d+)', pathlib.Path('.estate-leg-report').read_text())
+                      if m:
+                          cases, wall = int(m.group(1)), int(m.group(2))
+                  if rc == 0 and cases >= 1:
+                      status = 'OK'
+                  elif rc == 0:
+                      status, reason = 'FAIL', 'forgery-ok-with-zero-cases'
+                  else:
+                      status, reason = 'FAIL', 'hook-rc-%d' % rc
+          digest = hashlib.sha256(('%s|%s|%s' % (lid, shape, raw)).encode()).hexdigest()[:12]
+          line = 'LEG %s %s cases=%d wall=%d' % (lid, status, cases, wall)
+          if status == 'SKIP':
+              line += ' reason=%s digest=%s' % (reason, digest)
+          pathlib.Path(prov, 'leg-%s.ledger' % lid).write_text(line + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('    %s\n' % line)
+          pathlib.Path('.estate-rc').write_text('0' if status in ('OK','SKIP') else '1')
+          PY
+      - name: leg verdict
+        run: exit "$(cat .estate-rc 2>/dev/null || echo 1)"
+      - name: "upload ledger (artifact-gate: name embeds run_id + -a<run_attempt>; provenance tree)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ESTATE_ARTIFACT_NAME }}
+          path: ${{ env.ESTATE_PROV_DIR }}
+          retention-days: ${{ env.ESTATE_RETENTION || '90' }}
+          if-no-files-found: error
+
+  gates:
+    name: gates
+    needs: [preflight, admission, leg]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: resolve ledger pattern (artifact-gate)
+        run: |
+          prefix=ledger
+          if [ "$IN_ARTIFACT_GATE" != "default" ]; then
+            prefix=$(printf '%s' "$IN_ARTIFACT_GATE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("artifact_name","ledger"))')
+          fi
+          echo "ESTATE_LEDGER_PATTERN=${prefix}__*__${GITHUB_RUN_ID}-a*" >> "$GITHUB_ENV"
+        env:
+          IN_ARTIFACT_GATE: ${{ inputs['artifact-gate'] }}
+      - uses: actions/checkout@v4
+      - name: download attempt ledgers
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.ESTATE_LEDGER_PATTERN }}
+          path: .estate-ledgers
+      - name: "rollup: fail-closed markers, STALE_ATTEMPT, independent admission recompute (S6), budget flags (S5)"
+        env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          ADMISSION_RESULT: ${{ needs.admission.result }}
+          LEG_RESULT: ${{ needs.leg.result }}
+          MATRIX_JSON: ${{ needs.preflight.outputs.matrix }}
+          PLAN_JSON: ${{ needs.preflight.outputs.plan }}
+          ADMISSION_SHAPE: ${{ needs.admission.outputs.shape }}
+          ADMISSION_REASON: ${{ needs.admission.outputs.reason }}
+          IN_BUDGET: ${{ inputs.budget }}
+          IN_PATHS: ${{ inputs.paths }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, pathlib, re, subprocess, sys, time
+          MARK = re.compile(r'^LEG (\S+) (OK|SKIP|FAIL) cases=(\d+) wall=(\d+)(?: reason=(\S+) digest=([0-9a-f]{12,}))?\s*$')
+          def gh_json(*args):
+              p = subprocess.run(['gh','api',*args], capture_output=True, text=True)
+              if p.returncode != 0:
+                  return None
+              try:
+                  return json.loads(p.stdout)
+              except Exception:
+                  return None
+          def red(marker, detail=''):
+              lines.append('- `GATES RED %s %s`' % (marker, detail))
+              return 1
+          lines, rc = [], 0
+          event = os.environ['GITHUB_EVENT_NAME']
+          repo = os.environ['GITHUB_REPOSITORY']
+          ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          pr = ev.get('pull_request') or {}
+          if event == 'pull_request':
+              ev_head = pr['head']['sha']
+              live = gh_json('repos/%s/pulls/%s' % (repo, pr['number'])) or {}
+              live_head = (live.get('head') or {}).get('sha')
+              if live_head and live_head != ev_head:
+                  subprocess.run(['gh','api','repos/%s/statuses/%s' % (repo, ev_head),
+                                  '-f','state=pending','-f','context=gates',
+                                  '-f','description=gates admission pending (head amended mid-run, awaiting re-run)'])
+                  subprocess.run(['gh','run','cancel', os.environ['GITHUB_RUN_ID'], '--repo', repo])
+                  for _ in range(40):
+                      st = gh_json('repos/%s/actions/runs/%s' % (repo, os.environ['GITHUB_RUN_ID'])) or {}
+                      if st.get('status') == 'completed':
+                          sys.exit(0 if st.get('conclusion') == 'cancelled' else 1)
+                      time.sleep(3)
+                  sys.exit(1)
+          if os.environ['PREFLIGHT_RESULT'] != 'success':
+              rc = red('cause=preflight', 'see preflight named marker')
+          elif os.environ['ADMISSION_RESULT'] != 'success':
+              rc = red('cause=admission')
+          else:
+              matrix = json.loads(os.environ['MATRIX_JSON'])
+              expected = {r['id']: r for r in matrix.get('leg', [])}
+              markers, attempts = {}, set()
+              root = pathlib.Path('.estate-ledgers')
+              dirs = [d for d in root.iterdir() if d.is_dir()] if root.exists() else []
+              for d in dirs:
+                  tail = d.name.split('__')[-1]
+                  if '-a' in tail:
+                      try:
+                          attempts.add(int(tail.rsplit('-a', 1)[1]))
+                      except ValueError:
+                          rc = red('MALFORMED-ARTIFACT-NAME', d.name)
+                  for lf in d.glob('*.ledger'):
+                      for line in lf.read_text().splitlines():
+                          mm = MARK.match(line.strip())
+                          if not mm:
+                              rc = red('MALFORMED-MARKER', '%s: %s' % (d.name, line.strip()[:80]))
+                              continue
+                          mid, status, cases, wall, reason, digest = mm.groups()
+                          if mid in markers:
+                              rc = red('DUPLICATE-MARKER', mid)
+                          markers[mid] = dict(status=status, cases=int(cases), wall=int(wall), reason=reason, src=d.name)
+              if not dirs:
+                  rc = red('NO-MARKERS', 'zero ledger artifacts matched this run')
+              attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+              if attempts and attempts != {attempt}:
+                  rc = red('STALE_ATTEMPT', 'markers stitched across attempts %s != %d (rerun-all required)' % (sorted(attempts), attempt))
+              missing = set(expected) - set(markers)
+              if missing:
+                  rc = red('NO-WITHOUT-EVERY-MARKER', 'missing=%s (SKIP markers count)' % sorted(missing))
+              unknown = set(markers) - set(expected)
+              if unknown:
+                  rc = red('UNSCHEDULED-MARKER', str(sorted(unknown)))
+              for mid, mk in sorted(markers.items()):
+                  if mk['status'] == 'FAIL':
+                      rc = red('LEG-FAIL', mid + ((' reason=' + mk['reason']) if mk['reason'] else ''))
+                  elif mk['status'] == 'OK' and mk['cases'] < 1:
+                      rc = red('FORGERY', 'OK-with-cases=0 on %s' % mid)
+              plan = json.loads(os.environ.get('PLAN_JSON') or 'null')
+              if plan:
+                  py_ok = [r for r in matrix['leg'] if r['component'] == plan['component']]
+                  if rc == 0 and all(markers.get(r['id'], {}).get('status') == 'OK' for r in py_ok):
+                      got = sum(markers[r['id']]['cases'] for r in py_ok)
+                      if got != plan['total_cases']:
+                          rc = red('FORGERY', 'plan-cases %s != %s on %s' % (got, plan['total_cases'], plan['component']))
+                      else:
+                          lines.append('- `FORGERY TOOTH OK cases=%d matches plan`' % got)
+                  else:
+                      lines.append('- `FORGERY-SKIP reason=legs-skipped-or-prior-red`')
+              else:
+                  lines.append('- `FORGERY-SKIP reason=no-manifest`')
+              if event == 'pull_request' and rc == 0:
+                  DEFAULT = {
+                    'allow': [r'^docs/.+\.md$', r'^[^/]+\.md$', r'^LICENSE(\..*)?$', r'^docs/.+\.(png|jpe?g|gif|svg|webp)$'],
+                    'machine': [r'^graphify-out/'],
+                    'deny': [r'^\.github/', r'^tests/', r'^tests/(timing|budget|registry)\.json$', r'^tests/md_inputs\.txt$',
+                             r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|rs|rb|sh|bash|sql|c|h|hpp|cpp|java|kt|swift|css)$',
+                             r'(^|/)(pyproject\.toml|setup\.py|setup\.cfg|MANIFEST\.in|package\.json|package-lock\.json|pnpm-lock\.yaml|uv\.lock|poetry\.lock|Cargo\.toml|Cargo\.lock|go\.mod|go\.sum|Dockerfile|Makefile|\.gitignore)$'],
+                  }
+                  spec = dict(DEFAULT)
+                  if os.environ['IN_PATHS'] != 'default':
+                      cu = json.loads(os.environ['IN_PATHS'])
+                      spec = {'allow': cu.get('allow', []), 'machine': cu.get('machine', []), 'deny': cu.get('deny', DEFAULT['deny'])}
+                  cmp_ = gh_json('repos/%s/compare/%s...%s' % (repo, pr['base']['sha'], pr['head']['sha']))
+                  files = (cmp_ or {}).get('files')
+                  names = [f['filename'] for f in files] if files else None
+                  shape2, why = 'FULL', 'recompute-unparseable'
+                  if names:
+                      def deny2(f):
+                          return any(re.search(p, f) for p in spec['deny'])
+                      def mach2(f):
+                          return any(re.match(p, f) for p in spec['machine'])
+                      def alw2(f):
+                          return any(re.match(p, f) for p in spec['allow'])
+                      if any(deny2(f) for f in names):
+                          shape2, why = 'FULL', 'deny-wins'
+                      elif all(mach2(f) for f in names):
+                          shape2, why = 'MACHINE', 'graphify-out-only'
+                      elif all(alw2(f) for f in names):
+                          shape2, why = 'DOCS', 'docs-shape'
+                      else:
+                          shape2, why = 'FULL', 'outside-allow-spec'
+                  claimed = os.environ.get('ADMISSION_SHAPE') or 'FULL'
+                  if shape2 != claimed:
+                      rc = red('ADMISSION-FORGERY', 'event said %s, recompute says %s (%s)' % (claimed, shape2, why))
+                  else:
+                      lines.append('- `ADMISSION RECOMPUTED %s (%s) matches event`' % (shape2, why))
+              if os.environ.get('IN_BUDGET') and pathlib.Path(os.environ['IN_BUDGET']).exists():
+                  b = json.loads(pathlib.Path(os.environ['IN_BUDGET']).read_text())
+                  walls = sum(mk['wall'] for mk in markers.values() if mk['status'] == 'OK')
+                  flags = []
+                  if 'pr_gate_wall_s' in b and walls > b['pr_gate_wall_s']:
+                      flags.append('wall %ss > pr_gate_wall_s %ss' % (walls, b['pr_gate_wall_s']))
+                  timing_api = gh_json('repos/%s/actions/runs/%s/timing' % (repo, os.environ['GITHUB_RUN_ID'])) or {}
+                  run_ms = timing_api.get('run_duration_ms', 0)
+                  if 'runner_min_per_pr' in b and run_ms and run_ms / 60000 > b['runner_min_per_pr']:
+                      flags.append('run wall %.1f min > runner_min_per_pr %s (wall-proxy; weekly attribution is the weekly rollup)' % (run_ms/60000, b['runner_min_per_pr']))
+                  if flags:
+                      lines.append('- `BUDGET FLAG %s`' % '; '.join(flags))
+                      if event == 'pull_request':
+                          subprocess.run(['gh','pr','comment', str(pr['number']), '--repo', repo,
+                                          '--body', 'BUDGET FLAG (economic violation, not a contract violation; red fires only at the weekly rollup): ' + '; '.join(flags)])
+                  else:
+                      lines.append('- `BUDGET OK`')
+              else:
+                  lines.append('- `BUDGET SKIP reason=no-manifest-at-pointer`')
+              if rc == 0:
+                  ok = sum(1 for m in markers.values() if m['status'] == 'OK')
+                  sk = sum(1 for m in markers.values() if m['status'] == 'SKIP')
+                  lines.append('- `GATES GREEN ok=%d skip=%d`' % (ok, sk))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n'.join(lines) + '\n')
+          sys.exit(rc)
+          PY

@@ -1,0 +1,107 @@
+# ci-contract: estate-ci@v1
+# Canary — renders all seven consumer parameter blocks on every push to main and
+# every pull_request of this contract repo. A typo in the contract or in any
+# consumer block dies HERE, not in hw (NEXTGEN-CI.md (d), red-team patch S7).
+# Blocks mirror the spec (b) target rows: pins x components cross (D11), the
+# seven knobs passed literally, unique artifact-gate prefix per consumer.
+name: canary
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hw:
+    name: hermes-workflows
+    uses: ./.github/workflows/estate-ci.yml
+    with:
+      legs: '[{"label":"tip","python":"3.12","hermes_pin":"tip"}]'
+      components: '["py","pkg","doc"]'
+      shards: auto
+      lane_cap_s: 150
+      budget: tests/budget.json
+      paths: default
+      artifact-gate: '{"provenance_dir":"tests/runs","artifact_name":"ledger-hw","retention_days":90}'
+
+  hb:
+    name: hermes-beads
+    uses: ./.github/workflows/estate-ci.yml
+    with:
+      legs: '[{"label":"floor","python":"3.12","hermes_pin":"v2026.9.24","consumes":["py"]},{"label":"tip","python":"3.14","hermes_pin":"v0.22.2","consumes":["py"]},{"label":"node","python":"3.12","hermes_pin":"tip","consumes":["node"]}]'
+      components: '["py","node"]'
+      shards: auto
+      lane_cap_s: 150
+      budget: tests/budget.json
+      paths: default
+      artifact-gate: '{"provenance_dir":"tests/runs","artifact_name":"ledger-hb","retention_days":90}'
+
+  rui:
+    name: hermes-rich-ui
+    uses: ./.github/workflows/estate-ci.yml
+    with:
+      legs: '[{"label":"tip","python":"3.12","hermes_pin":"tip"}]'
+      components: '["py","node","doc"]'
+      shards: auto
+      lane_cap_s: 150
+      budget: tests/budget.json
+      paths: default
+      artifact-gate: '{"provenance_dir":"tests/runs","artifact_name":"ledger-rui","retention_days":90}'
+
+  lcm:
+    name: hermes-lcm
+    uses: ./.github/workflows/estate-ci.yml
+    with:
+      legs: '[{"label":"floor","python":"3.11","hermes_pin":"tip","consumes":["py"]},{"label":"tip","python":"3.12","hermes_pin":"tip","consumes":["py"]}]'
+      components: '["py"]'
+      shards: auto
+      lane_cap_s: 150
+      budget: tests/budget.json
+      paths: default
+      artifact-gate: '{"provenance_dir":"tests/runs","artifact_name":"ledger-lcm","retention_days":90}'
+
+  weather:
+    name: weather-app
+    uses: ./.github/workflows/estate-ci.yml
+    with:
+      legs: '[{"label":"fe","python":"3.12","hermes_pin":"tip","consumes":["node"]},{"label":"be","python":"3.12","hermes_pin":"tip","consumes":["py"]},{"label":"docker","python":"3.12","hermes_pin":"tip","consumes":["docker"]}]'
+      components: '["node","py","docker"]'
+      shards: auto
+      lane_cap_s: 120
+      budget: tests/budget.json
+      paths: default
+      artifact-gate: '{"provenance_dir":"tests/runs","artifact_name":"ledger-weather","retention_days":90}'
+
+  zikai:
+    name: zikai
+    uses: ./.github/workflows/estate-ci.yml
+    with:
+      legs: '[{"label":"tip","python":"3.12","hermes_pin":"tip"}]'
+      components: '["py"]'
+      shards: auto
+      lane_cap_s: 60
+      budget: tests/budget.json
+      paths: default
+      artifact-gate: '{"provenance_dir":"tests/runs","artifact_name":"ledger-zikai","retention_days":90}'
+
+  gc:
+    name: gc-runtime-nomad
+    uses: ./.github/workflows/estate-ci.yml
+    with:
+      legs: '[{"label":"tip","python":"3.12","hermes_pin":"tip","consumes":["go"]}]'
+      components: '["go"]'
+      shards: auto
+      lane_cap_s: 240
+      budget: tests/budget.json
+      paths: default
+      artifact-gate: '{"provenance_dir":"tests/runs","artifact_name":"ledger-gc","retention_days":90}'
