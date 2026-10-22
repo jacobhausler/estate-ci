@@ -634,6 +634,22 @@ jobs:
                   ok = sum(1 for m in markers.values() if m['status'] == 'OK')
                   sk = sum(1 for m in markers.values() if m['status'] == 'SKIP')
                   lines.append('- `GATES GREEN ok=%d skip=%d`' % (ok, sk))
+          # Emit the single required commit status (context `gates`). A ruleset requiring
+          # context `gates` cannot match the COMPOSITE check-run name a reusable-workflow
+          # rollup produces ("<caller job> / gates" — measured canary run 39698677505);
+          # the commit-status channel is the only emitter that keeps the required name
+          # exactly `gates` across the reuse boundary (statuses:write; the S6 amend path
+          # already posts context=gates pending on this same channel).
+          st_state = 'success' if rc == 0 else 'failure'
+          st_desc = ('gates %s run %s-a%s' % ('GREEN' if rc == 0 else 'RED', os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']))[:140]
+          sha_st = ev_head if event == 'pull_request' else os.environ['GITHUB_SHA']
+          st_post = subprocess.run(['gh','api','repos/%s/statuses/%s' % (repo, sha_st),
+                                    '-f', 'state=%s' % st_state, '-f', 'context=gates',
+                                    '-f', 'description=%s' % st_desc])
+          if st_post.returncode != 0:
+              rc = red('STATUS-POST-FAILED', 'required context gates has no emitter at this sha (fail closed)')
+          else:
+              lines.append('- `GATES STATUS %s posted context=gates`' % st_state)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write('\n'.join(lines) + '\n')
           sys.exit(rc)
