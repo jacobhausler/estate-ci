@@ -24,6 +24,9 @@ on:
   pull_request:
   push:
     branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   gates:
     uses: jacobhausler/estate-ci/.github/workflows/estate-ci.yml@v1

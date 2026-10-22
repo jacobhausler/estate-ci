@@ -49,10 +49,9 @@ permissions:
   pull-requests: write
   statuses: write
 
-concurrency:
-  group: estate-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
+# NOTE: no top-level `concurrency` here on purpose — reusable concurrency is evaluated
+# per called-job unit, so one group shared by N caller jobs self-cancels (measured
+# 2026-10-22, first main run). Concurrency belongs to the CALLER workflow.
 jobs:
   preflight:
     name: preflight
